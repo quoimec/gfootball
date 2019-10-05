@@ -57,6 +57,7 @@ setup(
         'scipy',
         'gym',
         'absl-py',
+        'numpy==1.16.4'
     ],
     include_package_data=True,
     keywords='gfootball reinforcement-learning python machine learning',

@@ -21,9 +21,11 @@ from __future__ import print_function
 
 import collections
 import cv2
+import math
 from gfootball.env import observation_preprocessing
 import gym
 import numpy as np
+import json
 
 
 class PeriodicDumpWriter(gym.Wrapper):
@@ -273,3 +275,294 @@ class FrameStack(gym.Wrapper):
 
   def _get_observation(self):
     return np.concatenate(list(self.obs), axis=-1)
+
+
+class Point:
+    
+    def __init__(self, *, x, y):
+        self.x = x
+        self.y = y
+        
+    def distance(self, x, y):
+        return math.sqrt(math.pow(x - self.x, 2) + math.pow(y - self.y, 2))
+        
+class Area:
+    
+    def __init__(self, *, origin, width, height):
+        
+        halfWidth = width * 0.5
+        halfHeight = height * 0.5
+        
+        self.width = width
+        self.height = height
+        self.topLeft = Point(x = origin.x - halfWidth, y = origin.y + halfHeight)
+        self.topRight = Point(x = origin.x + halfWidth, y = origin.y + halfHeight)
+        self.bottomLeft = Point(x = origin.x - halfWidth, y = origin.y - halfHeight)
+        self.bottomRight = Point(x = origin.x + halfWidth, y = origin.y - halfHeight)
+        
+    def contains(self, x, y):    
+        
+        return (x >= self.topLeft.x and x <= self.bottomRight.x) and (y >= self.bottomRight.y and y <= self.topLeft.y)
+
+class RewardTrack:
+    
+    def __init__(self):
+        self.rewards = {}
+        
+    def update(self, reward):
+        for key, value in reward.items():
+            if key in self.rewards:
+                self.rewards[key] += value
+            else:
+                self.rewards[key] = value
+        
+    def save(self, *, left, score, path):
+        with open(path, "a+") as file:
+            file.write("{}:{} - {}\n".format(score[int(not left)], score[int(left)], json.dumps(self.rewards)))
+        
+    def reset(self):
+        self.rewards = {}
+        
+class PassTrack:
+    
+    def __init__(self):
+        
+        self.count = 0
+        self.pending = False
+        self.opposition = []
+        self.start = None
+        self.end = None
+        self.player = None
+        self.furthest = None
+        self.received = False
+        self.intercepted = False
+
+    def track(self, *, left, action, ball, opposition, posession, mode, player):
+        
+        if action in [9, 10, 11] and posession:
+            
+            # Pass Started
+            self.start = ball
+            self.pending = True
+            self.opposition = opposition
+            self.player = player
+            
+        elif (self.count > 0 or self.pending) and (posession == False or mode != 0):
+            
+            # Pass Intercepted
+            self.pending = False
+            self.count = 0
+            self.opposition = []
+            self.player = None
+            self.furthest = None
+            self.intercepted = mode == 0
+        
+        elif self.pending and posession and player != self.player:
+            
+            # Pass Received
+            self.received = True
+            self.pending = False
+            self.end = ball
+            self.count += 1
+            
+    def finished(self):
+        
+        self.intercepted = False
+        
+        if self.received:
+            self.received = False
+            self.start = None
+            self.end = None
+            self.opposition = []
+            self.player = None
+            
+    def reset(self):
+        
+        self.count = 0
+        self.pending = False
+        self.opposition = []
+        self.start = None
+        self.end = None
+        self.player = None
+        self.furthest = None
+        self.received = False
+        self.intercepted = False
+            
+class RoleRewardWrapper(gym.RewardWrapper):
+
+    def __init__(self, env):
+        gym.RewardWrapper.__init__(self, env)
+        
+        # self.LeftGoal = Area(origin = Point(x = -1.05, y = 0.0), width = 0.1, height = 0.084)
+        # self.RightGoal = Area(origin = Point(x = 1.05, y = 0.0), width = 0.1, height = 0.084)
+        
+        self.LeftGoal = Point(x = -1.0, y = 0.0)
+        self.RightGoal = Point(x = 1.0, y = 0.0)
+        self.LeftBox = Area(origin = Point(x = -0.9, y = 0.0), width = 0.2, height = 0.36)
+        self.RightBox = Area(origin = Point(x = 0.9, y = 0.0), width = 0.2, height = 0.36)
+        self.LeftHalf = Area(origin = Point(x = -0.5, y = 0.0), width = 1.0, height = 0.84)
+        self.RightHalf = Area(origin = Point(x = 0.5, y = 0.0), width = 1.0, height = 0.84)
+        
+        self.RewardTrack = RewardTrack()
+        self.PassTrack = PassTrack()
+        
+    def reward(self, reward):
+
+        if self.env.unwrapped.last_observation is None:
+            return reward
+
+        assert len(reward) == len(self.env.unwrapped.last_observation)
+
+        for index in range(len(reward)):
+            
+            observation = self.env.unwrapped.last_observation[index]
+            
+            if observation["steps_left"] == 2999:
+                self.RewardTrack.reset()
+                self.PassTrack.reset()
+            
+            left = observation['is_left']
+            agent = "left" if left else "right"
+            computer = "left" if not left else "right"
+            
+            Position = lambda object: Point(x = object[0], y = object[1])
+            
+            action = self.env.unwrapped._agent._action
+            ball = Position(observation["ball"])
+            keeper = Position(observation["{}_team".format(agent)][np.where(observation["{}_team_roles".format(agent)] == 0)][0])
+            opposition = observation["{}_team".format(computer)]
+            
+            if observation["ball_owned_team"] == -1:
+                posession = None
+            elif observation["ball_owned_team"] == 0:
+                posession = left
+            elif observation["ball_owned_team"] == 1:
+                posession = not left
+            
+            self.PassTrack.track(left = left, action = action, ball = ball, opposition = opposition, posession = posession, mode = observation["game_mode"], player = observation["ball_owned_player"])
+            
+            rewards = {
+                "BaseReward": float(reward[index]),
+                "KeeperPosition": self.keeperPosition(left = left, keeper = keeper, ball = ball),
+                "KeeperPositionScored": self.keeperPositionScored(left = left, reward = reward[index], keeper = keeper),
+                # "ChainedPasses": self.chainedPasses(),
+                "BisectedPasses": self.bisectedPasses(left = left, ball = ball, opposition = opposition),
+                "ForwardPasses": self.forwardPasses(left = left, ball = ball),
+                "InterceptedPasses": self.interceptedPass(),
+                "ChainedPassesScored": self.chainedPassesScored(reward = reward[index]),
+                "ShotReward": self.shotReward(left = left, action = action, ball = ball)
+            }
+            
+            reward[index] = sum(rewards.values())
+            
+            self.PassTrack.finished()
+            self.RewardTrack.update(rewards)
+            
+            if observation["steps_left"] == 100: self.RewardTrack.save(left = left, score = observation["score"], path = "/home/charlie/Projects/Python/Football/rewards.txt")
+                    
+        return reward        
+
+    def keeperPosition(self, *, left, keeper, ball, discount = 0.0001):
+    
+        """ Keeper Position:
+            Check the keeper position when the ball is in the agent's half.
+            If the keeper is more than 30% of the way up it's half, punish the agent based on their distance from the 30% mark.
+            
+            Reward Graph: https://www.desmos.com/calculator/pj6bk3c7wz
+        """
+        
+        half = self.LeftHalf if left else self.RightHalf
+        goalline = self.LeftGoal if left else self.RightGoal
+        distance = goalline.distance(x = keeper.x, y = keeper.y)
+        
+        if half.contains(x = ball.x, y = ball.y) and distance > 0.4:
+            return -((distance - 0.4) / 3) * discount
+        else:
+            return 0
+    
+    def keeperPositionScored(self, *, left, reward, keeper):
+        
+        """ Keeper Position Scored:
+            When the opposition scores, check the keeper position to see how far they are from their base goal line.
+            If the keeper is far off the baseline, punish the agent based of their distance from the goal.
+            
+            Reward Graph: https://www.desmos.com/calculator/490p558fho
+        """
+        
+        if reward != -1: 
+            return 0
+        
+        goalline = self.LeftGoal if left else self.RightGoal
+        distance = goalline.distance(x = keeper.x, y = keeper.y)
+        
+        if distance <= 0.15:
+            return 0
+        
+        return -(math.pow(distance - 0.15, 2) * 300)
+    
+    def chainedPasses(self):
+        
+        if not self.PassTrack.received: return 0
+        
+        chained = lambda x: 0 if x not in range(1, 10) else 9.974660000000001 * 10 ** -18 + 0.004 * x - 0.0004 * x ** 2
+        
+        return chained(self.PassTrack.count)
+    
+    def bisectedPasses(self, *, left, ball, opposition, discount = 0.0008):
+        
+        if not self.PassTrack.received: return 0
+        
+        if (left and (self.PassTrack.start.y < -0.75 or self.PassTrack.start.y > 0.9)) or (not left and (self.PassTrack.start.y > 0.75 or self.PassTrack.start.y < -0.9)): return 0
+        
+        distance = lambda start, end, player: abs((start.y - end.y) * player.x + (end.x - start.y) * player.y + (start.x * end.y - end.x * start.y)) / ((start.y - end.y) ** 2 + (end.x - start.y) ** 2) ** (1/2)
+            
+        bisection = lambda distances: discount * sum(distances)
+        
+        minimum = min(self.PassTrack.start.x, ball.x)
+        maximum = max(self.PassTrack.start.x, ball.x)
+        
+        active = list(filter(lambda a: a[0] >= minimum and a[0] <= maximum, (self.PassTrack.opposition + opposition)))
+        distances = list(filter(lambda b: b > 0, map(lambda a: 0.42 - distance(self.PassTrack.start, ball, Point(x = a[0], y = a[1])), active)))
+            
+        return bisection(distances)    
+    
+    def forwardPasses(self, *, left, ball, discount = 0.002):
+        
+        if not self.PassTrack.received or (self.PassTrack.start is None or self.PassTrack.end is None): return 0
+        
+        if (left and (self.PassTrack.start.y < -0.8 or self.PassTrack.start.y > 0.9)) or (not left and (self.PassTrack.start.y > 0.8 or self.PassTrack.start.y < -0.9)): return 0
+        
+        if self.PassTrack.furthest is None: self.PassTrack.furthest = self.PassTrack.start.y
+        
+        distance = lambda a, b: abs(a - b) * (discount / 2.0)
+        
+        if (left and self.PassTrack.end.y > self.PassTrack.start.y and self.PassTrack.end.y > self.PassTrack.furthest) or (not left and self.PassTrack.end < self.PassTrack.start.y and self.PassTrack.end.y < self.PassTrack.furthest):
+            reward = distance(self.PassTrack.end.y, self.PassTrack.furthest)
+        else:
+            reward = 0
+            
+        self.PassTrack.furthest = max(self.PassTrack.furthest, self.PassTrack.end.y, self.PassTrack.start.y) if left else min(self.PassTrack.furthest, self.PassTrack.end.y, self.PassTrack.start.y)
+        
+        return reward  
+        
+    def interceptedPass(self, discount = 0.002):
+        
+        if self.PassTrack.intercepted:
+            return -1 * discount
+        else:
+            return 0
+        
+    def chainedPassesScored(self, *, reward, discount = 0.01):
+        
+        if reward == 1: 
+            return discount * self.PassTrack.count
+        else:
+            return 0
+            
+    def shotReward(self, *, left, action, ball, discount = 0.0009):
+        
+        if action == 12 and ((left and ball.y > 0.75 and ball.y < 1.0) or (not left and ball.y < -0.75 and ball.y > -1.0)):
+            return (0.25 - abs(0.9 - abs(ball.y))) * discount
+        else: 
+            return 0
+            

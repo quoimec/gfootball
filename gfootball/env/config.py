@@ -28,7 +28,7 @@ import gfootball_engine as libgame
 
 FLAGS = flags.FLAGS
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s: %(message)s')
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s: %(message)s')
 
 
 def log(func):
