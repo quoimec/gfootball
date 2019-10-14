@@ -24,8 +24,9 @@ import cv2
 import math
 from gfootball.env import observation_preprocessing
 import gym
-import numpy as np
 import json
+import numpy as np
+from PIL import Image
 
 
 class PeriodicDumpWriter(gym.Wrapper):
@@ -317,8 +318,10 @@ class RewardTrack:
                 self.rewards[key] = value
         
     def save(self, *, left, score, path):
+        self.rewards["GoalsFor"] = score[int(not left)]
+        self.rewards["GoalsAgainst"] = score[int(left)]
         with open(path, "a+") as file:
-            file.write("{}:{} - {}\n".format(score[int(not left)], score[int(left)], json.dumps(self.rewards)))
+            file.write(json.dumps(self.rewards) + ",\n")
         
     def reset(self):
         self.rewards = {}
@@ -406,6 +409,8 @@ class RoleRewardWrapper(gym.RewardWrapper):
         self.RewardTrack = RewardTrack()
         self.PassTrack = PassTrack()
         
+        self.CrossMatch = None
+        
     def reward(self, reward):
 
         if self.env.unwrapped.last_observation is None:
@@ -418,6 +423,10 @@ class RoleRewardWrapper(gym.RewardWrapper):
             observation = self.env.unwrapped.last_observation[index]
             
             if observation["steps_left"] == 2999:
+                
+                if self.CrossMatch is not None:
+                    self.RewardTrack.save(left = self.CrossMatch[0], score = self.CrossMatch[1], path = "/home/charlie/Projects/Python/Football/rewards.txt")
+                
                 self.RewardTrack.reset()
                 self.PassTrack.reset()
             
@@ -443,22 +452,21 @@ class RoleRewardWrapper(gym.RewardWrapper):
             
             rewards = {
                 "BaseReward": float(reward[index]),
-                "KeeperPosition": self.keeperPosition(left = left, keeper = keeper, ball = ball),
+                # "KeeperPosition": self.keeperPosition(left = left, keeper = keeper, ball = ball),
                 "KeeperPositionScored": self.keeperPositionScored(left = left, reward = reward[index], keeper = keeper),
-                # "ChainedPasses": self.chainedPasses(),
+                "ChainedPasses": self.chainedPasses(),
                 "BisectedPasses": self.bisectedPasses(left = left, ball = ball, opposition = opposition),
                 "ForwardPasses": self.forwardPasses(left = left, ball = ball),
                 "InterceptedPasses": self.interceptedPass(),
                 "ChainedPassesScored": self.chainedPassesScored(reward = reward[index]),
-                "ShotReward": self.shotReward(left = left, action = action, ball = ball)
+                "ShotReward": self.shotReward(left = left, action = action, posession = posession, ball = ball)
             }
             
             reward[index] = sum(rewards.values())
             
             self.PassTrack.finished()
             self.RewardTrack.update(rewards)
-            
-            if observation["steps_left"] == 100: self.RewardTrack.save(left = left, score = observation["score"], path = "/home/charlie/Projects/Python/Football/rewards.txt")
+            self.CrossMatch = left, observation["score"]
                     
         return reward        
 
@@ -480,7 +488,7 @@ class RoleRewardWrapper(gym.RewardWrapper):
         else:
             return 0
     
-    def keeperPositionScored(self, *, left, reward, keeper):
+    def keeperPositionScored(self, *, left, reward, keeper, discount = 0.05):
         
         """ Keeper Position Scored:
             When the opposition scores, check the keeper position to see how far they are from their base goal line.
@@ -495,24 +503,24 @@ class RoleRewardWrapper(gym.RewardWrapper):
         goalline = self.LeftGoal if left else self.RightGoal
         distance = goalline.distance(x = keeper.x, y = keeper.y)
         
-        if distance <= 0.15:
+        if distance <= 0.25:
             return 0
         
-        return -(math.pow(distance - 0.15, 2) * 300)
+        return -(math.pow(distance - 0.25, 2) * 300) * discount
     
-    def chainedPasses(self):
+    def chainedPasses(self, discount = 0.1):
         
         if not self.PassTrack.received: return 0
         
         chained = lambda x: 0 if x not in range(1, 10) else 9.974660000000001 * 10 ** -18 + 0.004 * x - 0.0004 * x ** 2
         
-        return chained(self.PassTrack.count)
+        return chained(self.PassTrack.count) * discount
     
-    def bisectedPasses(self, *, left, ball, opposition, discount = 0.0008):
+    def bisectedPasses(self, *, left, ball, opposition, discount = 0.006):
         
         if not self.PassTrack.received: return 0
         
-        if (left and (self.PassTrack.start.y < -0.75 or self.PassTrack.start.y > 0.9)) or (not left and (self.PassTrack.start.y > 0.75 or self.PassTrack.start.y < -0.9)): return 0
+        # if (left and (self.PassTrack.start.x < -0.2 or self.PassTrack.start.x > 0.9)) or (not left and (self.PassTrack.start.x > 0.2 or self.PassTrack.start.x < -0.9)): return 0
         
         distance = lambda start, end, player: abs((start.y - end.y) * player.x + (end.x - start.y) * player.y + (start.x * end.y - end.x * start.y)) / ((start.y - end.y) ** 2 + (end.x - start.y) ** 2) ** (1/2)
             
@@ -522,47 +530,93 @@ class RoleRewardWrapper(gym.RewardWrapper):
         maximum = max(self.PassTrack.start.x, ball.x)
         
         active = list(filter(lambda a: a[0] >= minimum and a[0] <= maximum, (self.PassTrack.opposition + opposition)))
-        distances = list(filter(lambda b: b > 0, map(lambda a: 0.42 - distance(self.PassTrack.start, ball, Point(x = a[0], y = a[1])), active)))
+        distances = list(filter(lambda b: b > 0, map(lambda a: 0.60 - distance(self.PassTrack.start, ball, Point(x = a[0], y = a[1])), active)))
             
         return bisection(distances)    
     
-    def forwardPasses(self, *, left, ball, discount = 0.002):
+    def forwardPasses(self, *, left, ball, discount = 0.008):
         
         if not self.PassTrack.received or (self.PassTrack.start is None or self.PassTrack.end is None): return 0
         
-        if (left and (self.PassTrack.start.y < -0.8 or self.PassTrack.start.y > 0.9)) or (not left and (self.PassTrack.start.y > 0.8 or self.PassTrack.start.y < -0.9)): return 0
+        # if (left and (self.PassTrack.start.x < -0.8 or self.PassTrack.start.x > 0.9)) or (not left and (self.PassTrack.start.x > 0.8 or self.PassTrack.start.x < -0.9)): return 0
         
-        if self.PassTrack.furthest is None: self.PassTrack.furthest = self.PassTrack.start.y
+        if self.PassTrack.furthest is None: self.PassTrack.furthest = self.PassTrack.start.x
         
         distance = lambda a, b: abs(a - b) * (discount / 2.0)
         
-        if (left and self.PassTrack.end.y > self.PassTrack.start.y and self.PassTrack.end.y > self.PassTrack.furthest) or (not left and self.PassTrack.end < self.PassTrack.start.y and self.PassTrack.end.y < self.PassTrack.furthest):
-            reward = distance(self.PassTrack.end.y, self.PassTrack.furthest)
+        if (left and self.PassTrack.end.x > self.PassTrack.start.x and self.PassTrack.end.x > self.PassTrack.furthest) or (not left and self.PassTrack.end < self.PassTrack.start.x and self.PassTrack.end.x < self.PassTrack.furthest):
+            reward = distance(self.PassTrack.end.x, self.PassTrack.furthest)
         else:
             reward = 0
             
-        self.PassTrack.furthest = max(self.PassTrack.furthest, self.PassTrack.end.y, self.PassTrack.start.y) if left else min(self.PassTrack.furthest, self.PassTrack.end.y, self.PassTrack.start.y)
+        self.PassTrack.furthest = max(self.PassTrack.furthest, self.PassTrack.end.x, self.PassTrack.start.x) if left else min(self.PassTrack.furthest, self.PassTrack.end.x, self.PassTrack.start.x)
         
         return reward  
         
-    def interceptedPass(self, discount = 0.002):
+    def interceptedPass(self, discount = 0.00000005):
         
         if self.PassTrack.intercepted:
             return -1 * discount
         else:
             return 0
         
-    def chainedPassesScored(self, *, reward, discount = 0.01):
+    def chainedPassesScored(self, *, reward, discount = 0.5):
         
         if reward == 1: 
             return discount * self.PassTrack.count
         else:
             return 0
             
-    def shotReward(self, *, left, action, ball, discount = 0.0009):
+    def shotReward(self, *, left, action, posession, ball, discount = 0.01):
         
-        if action == 12 and ((left and ball.y > 0.75 and ball.y < 1.0) or (not left and ball.y < -0.75 and ball.y > -1.0)):
-            return (0.25 - abs(0.9 - abs(ball.y))) * discount
+        if action == 12 and posession and ((left and ball.x > 0.4 and ball.x < 0.98) or (not left and ball.x < -0.4 and ball.x > -0.98)) and (abs(ball.y) <= 0.16):
+            return max(0.0, 0.2 - abs(0.2 - (self.LeftGoal if left else self.RightGoal).distance(ball.x, ball.y))) * discount
         else: 
             return 0
             
+    def saveImage(self, *, frame, file, path = "/home/charlie/Projects/Python/Football/images/{}"):
+        
+        image = Image.fromarray(frame)        
+        image.save(path.format(file), "PNG")   
+            
+class FastRewardWrapper(gym.RewardWrapper):
+
+    def __init__(self, env):
+        gym.RewardWrapper.__init__(self, env)            
+            
+    def reward(self, reward):
+
+        if self.env.unwrapped.last_observation is None:
+            return reward
+
+        assert len(reward) == len(self.env.unwrapped.last_observation)
+
+        for index in range(len(reward)):
+            
+            observation = self.env.unwrapped.last_observation[index]
+            
+            if reward[index] == 1:
+                reward[index] += (observation["steps_left"] ** 2 / 3000 ** 2) - 0.8
+                
+        return reward
+            
+class ReduceRewardWrapper(gym.RewardWrapper):
+
+    def __init__(self, env):
+        gym.RewardWrapper.__init__(self, env)            
+            
+    def reward(self, reward):
+
+        if self.env.unwrapped.last_observation is None:
+            return reward
+
+        assert len(reward) == len(self.env.unwrapped.last_observation)
+
+        for index in range(len(reward)):
+            
+            reward[index] *= 0.2 
+            
+        return reward            
+        
+        
+        

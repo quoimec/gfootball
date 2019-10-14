@@ -134,10 +134,14 @@ def create_environment(env_name='',
   if dump_frequency > 1:
     env = wrappers.PeriodicDumpWriter(env, dump_frequency)
   assert 'scoring' in rewards.split(',')
+  if "fast" in rewards.split(","):
+      env = wrappers.FastRewardWrapper(env)
   if "roles" in rewards.split(","):
     env = wrappers.RoleRewardWrapper(env)
   if 'checkpoints' in rewards.split(','):
     env = wrappers.CheckpointRewardWrapper(env)
+  if "reduce" in rewards.split(","):
+      env = wrappers.ReduceRewardWrapper(env)
   if representation.startswith('pixels'):
     env = wrappers.PixelsStateWrapper(env, 'gray' in representation,
                                       channel_dimensions)
